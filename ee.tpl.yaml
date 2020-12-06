@@ -36,7 +36,6 @@ Resources:
         - "arn:aws:iam::aws:policy/ComprehendFullAccess"
         - "arn:aws:iam::aws:policy/TranslateFullAccess"
         - "arn:aws:iam::aws:policy/AmazonTranscribeFullAccess"
-        - "arn:aws:iam::aws:policy/AmazonFraudDetectorFullAccessPolicy"
       Policies:
         - PolicyName: AccessPolicy
           PolicyDocument:
