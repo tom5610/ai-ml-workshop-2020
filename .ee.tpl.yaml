@@ -1,6 +1,19 @@
 # This basic CloudFormation template is used in temporary EventEngine accounts... The permissions are probably
 # more generous than you'd want to grant in a production account!
 AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  RecordingsPrefix:
+    Default: recordings/
+    Description: Name of folder where recordings would be stored
+    Type: String
+  TranscriptionJobCheckWaitTime:
+    Default: 2
+    Description: Time between transcription job checks
+    Type: Number
+  TranscriptsPrefix:
+    Default: transcripts/
+    Description: Name of folder where transcripts would be stored
+    Type: String
 Resources:
   SageMakerIamRole:
     Type: AWS::IAM::Role
@@ -19,7 +32,27 @@ Resources:
         - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
         - "arn:aws:iam::aws:policy/service-role/AmazonPersonalizeFullAccess"
         - "arn:aws:iam::aws:policy/IAMFullAccess"
-        - "arn:aws:iam::aws:policy/AWSLambdaFullAccess"
+        - "arn:aws:iam::aws:policy/AWSLambda_FullAccess"
+        - "arn:aws:iam::aws:policy/ComprehendFullAccess"
+        - "arn:aws:iam::aws:policy/TranslateFullAccess"
+        - "arn:aws:iam::aws:policy/AmazonTranscribeFullAccess"
+      Policies:
+        - PolicyName: AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Sid: EventAccess
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource:
+                - arn:aws:ssm:*:*:parameter/aiml-lab/*
+            - Sid: RekognitionAccess
+              Effect: Allow
+              Action:
+                - rekognition:*
+              Resource: "*"              
 
   # SageMaker notebook
   NotebookConfig:
@@ -49,3 +82,555 @@ Resources:
       RoleArn: !GetAtt SageMakerIamRole.Arn
       VolumeSizeInGB: 20
       DefaultCodeRepository: https://github.com/tom5610/ai-ml-workshop-2020.git
+
+  ComprehendGlueDatabase:
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseInput:
+        Description: Glue metadata for sentiment analysis
+    Type: AWS::Glue::Database
+  ComprehendGlueTable:
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseName:
+        Ref: ComprehendGlueDatabase
+      TableInput:
+        Description: Amazon Connect call recording sentiment analysis
+        Name: sentiment_analysis
+        Parameters:
+          EXTERNAL: true
+          classification: json
+          typeOfData: file
+        StorageDescriptor:
+          Columns:
+          - Name: talker
+            Type: string
+          - Name: key
+            Type: string
+          - Name: contactid
+            Type: string
+          - Name: text
+            Type: array<string>
+          - Name: sentiment
+            Type: array<struct<index:int,sentiment:string,sentimentscore:struct<positive:double,negative:double,neutral:double,mixed:double>>>
+          - Name: entities
+            Type: array<struct<index:int,entities:array<struct<score:double,type:string,text:string,beginoffset:int,endoffset:int>>>>
+          - Name: keyphrases
+            Type: array<struct<index:int,keyphrases:array<struct<score:double,text:string,beginoffset:int,endoffset:int>>>>
+          - Name: dominantlanguage
+            Type: array<struct<index:int,languages:array<struct<languagecode:string,score:double>>>>
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          Location:
+            Fn::Join:
+            - ''
+            - - s3://
+              - Ref: SrcBucket
+              - /comprehend/
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            Parameters:
+              paths: talker,key,contactId,text,Sentiment,Entities,KeyPhrases,DominantLanguage
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+          StoredAsSubDirectories: true
+        TableType: EXTERNAL_TABLE
+    Type: AWS::Glue::Table
+  ComprehendTranscriptLambda:
+    Properties:
+      CodeUri: s3://aws-machine-learning-blog/artifacts/sentiment-analysis-on-call-recordings/ComprehendTranscriptLambda.zip
+      Description: lambda to submit a transcribe job
+      Environment:
+        Variables:
+          LANGUAGE_CODE: en-US
+      Events:
+        ComprehendTranscriptEvent:
+          Properties:
+            Bucket:
+              Ref: SrcBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                - Name: prefix
+                  Value:
+                    Ref: TranscriptsPrefix
+          Type: S3
+      FunctionName: comprehend_transcript_lambda
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role:
+        Fn::GetAtt:
+        - ComprehendTranscriptLambdaRole
+        - Arn
+      Runtime: python3.6
+      Timeout: 3
+    Type: AWS::Serverless::Function
+  ComprehendTranscriptLambdaRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - comprehend:Detect*
+            - comprehend:BatchDetect*
+            Effect: Allow
+            Resource: '*'
+          Version: '2012-10-17'
+        PolicyName: comprehend_transcript_lambda_comprehend_policy
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - s3:PutObject
+            - s3:GetObject
+            Effect: Allow
+            Resource:
+              Fn::Join:
+              - ''
+              - - 'arn:aws:s3:::'
+                - Fn::GetAtt:
+                  - S3BucketNameResource
+                  - BucketName
+                - /*
+          Version: '2012-10-17'
+        PolicyName: comprehend_transcript_lambda_s3_policy
+    Type: AWS::IAM::Role
+
+  LambdaLogPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: "lambda_logging_policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+            - logs:CreateLogStream
+            - logs:CreateLogGroup
+            - logs:PutLogEvents
+            Effect: Allow
+            Resource:
+            - arn:aws:logs:*:*:*
+      Roles:
+        - Ref: "ComprehendTranscriptLambdaRole"
+        - Ref: "GetTranscribeJobLambdaTaskRole"
+        - Ref: "S3BucketResourceRole"
+        - Ref: "SaveTranscriptionToS3LambdaTaskRole"
+        - Ref: "SplitAudioLambdaRole"
+        - Ref: "StartTranscribeExecutionLambdaRole"
+        - Ref: "SubmitTranscribeJobLambdaTaskRole"
+  GetTranscribeJobLambdaTask:
+    Properties:
+      CodeUri: s3://aws-machine-learning-blog/artifacts/sentiment-analysis-on-call-recordings/GetTranscribeJobLambdaTask.zip
+      Description: lambda to get a transcribe job status
+      FunctionName: get_transcribe_job_status
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role:
+        Fn::GetAtt:
+        - GetTranscribeJobLambdaTaskRole
+        - Arn
+      Runtime: python3.6
+      Timeout: 3
+    Type: AWS::Serverless::Function
+  GetTranscribeJobLambdaTaskRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+        Version: '2012-10-17'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonTranscribeFullAccess
+    Type: AWS::IAM::Role
+  S3BucketCustomResourceLambda:
+    Properties:
+      CodeUri: s3://aws-machine-learning-blog/artifacts/sentiment-analysis-on-call-recordings/S3BucketCustomResourceLambda.zip
+      Description: custom resoure to create s3 bucket on the fly
+      FunctionName: s3_bucket_custom_resource_for_recordings_lambda
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role:
+        Fn::GetAtt:
+        - S3BucketResourceRole
+        - Arn
+      Runtime: python3.6
+      Timeout: 3
+    Type: AWS::Serverless::Function
+  S3BucketNameResource:
+    Properties:
+      ServiceToken:
+        Fn::GetAtt:
+        - S3BucketCustomResourceLambda
+        - Arn
+    Type: Custom::CreateS3Bucket
+  S3BucketResourceRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+        Version: '2012-10-17'
+      Path: /
+    Type: AWS::IAM::Role
+
+
+  s3bucketresourcepolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: "s3_bucket_resource_s3_policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+            - s3:PutObject
+            - s3:GetObject
+            - s3:HeadObject
+            - s3:CreateBucket
+            Effect: Allow
+            Resource: "*"
+      Roles:
+        - Ref: "S3BucketResourceRole"
+  SaveTranscriptionToS3LambdaTask:
+    Properties:
+      CodeUri: s3://aws-machine-learning-blog/artifacts/sentiment-analysis-on-call-recordings/SaveTranscriptionToS3LambdaTask.zip
+      Description: lambda to save transcription to S3
+      FunctionName: save_transcription_to_s3
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role:
+        Fn::GetAtt:
+        - SaveTranscriptionToS3LambdaTaskRole
+        - Arn
+      Runtime: python3.6
+      Timeout: 3
+    Type: AWS::Serverless::Function
+  SaveTranscriptionToS3LambdaTaskRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+        Version: '2012-10-17'
+      Path: /
+    Type: AWS::IAM::Role
+  saveTransacriptions3resourcepolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: "save_transcription_to_s3_policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+            - s3:PutObject
+            - s3:PutObjectTagging
+            - s3:RestoreObject
+            Effect: Allow
+            Resource:
+              Fn::Join:
+              - ''
+              - - 'arn:aws:s3:::'
+                - Fn::GetAtt:
+                  - S3BucketNameResource
+                  - BucketName
+                - /*
+      Roles:
+        - Ref: "SaveTranscriptionToS3LambdaTaskRole"
+  SplitAudioLambda:
+    Properties:
+      CodeUri: s3://aws-machine-learning-blog/artifacts/sentiment-analysis-on-call-recordings/SplitAudioLambda.zip
+      Description: lambda to save transcription to S3
+      Environment:
+        Variables:
+          destination_bucket:
+            Fn::GetAtt:
+            - S3BucketNameResource
+            - BucketName
+          destination_folder:
+            Ref: RecordingsPrefix
+          left_key_prefix: Customer
+          right_key_prefix: Agent
+      Events:
+        SplitAudioEvent:
+          Properties:
+            Bucket:
+              Ref: SrcBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                - Name: prefix
+                  Value: connect/
+          Type: S3
+      FunctionName: split_audio_lambda
+      Handler: split_audio.split_new_recording
+      MemorySize: 128
+      Role:
+        Fn::GetAtt:
+        - SplitAudioLambdaRole
+        - Arn
+      Runtime: python3.6
+      Timeout: 3
+    Type: AWS::Serverless::Function
+  SplitAudioLambdaRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+        Version: '2012-10-17'
+      Path: /
+    Type: AWS::IAM::Role
+  splitAudios3resourcepolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: "split_recording_audio_lambda_s3_policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Action:
+          - s3:PutObject
+          - s3:GetObject
+          - s3:HeadObject
+          Effect: Allow
+          Resource:
+            Fn::Join:
+            - ''
+            - - 'arn:aws:s3:::'
+              - Fn::GetAtt:
+                - S3BucketNameResource
+                - BucketName
+              - /*
+      Roles:
+        - Ref: "SplitAudioLambdaRole"
+  SrcBucket:
+    DeletionPolicy: Retain
+    Properties:
+      BucketName:
+        Fn::GetAtt:
+        - S3BucketNameResource
+        - BucketName
+    Type: AWS::S3::Bucket
+
+  SentimentAnalysisS3BucketNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /aiml-lab/sentiment_analysis_s3_bucket_name
+      Type: String
+      Value: !Ref SrcBucket
+
+  StartTranscribeExecutionLambda:
+    Properties:
+      CodeUri: s3://aws-machine-learning-blog/artifacts/sentiment-analysis-on-call-recordings/StartTranscribeExecutionLambda.zip
+      Description: lambda to save transcription to S3
+      Environment:
+        Variables:
+          LANGUAGE_CODE: en-US
+          MEDIA_FORMAT: wav
+          TRANSCRIBE_STATE_MACHINE_ARN:
+            Ref: TranscribeStateMachine
+          TRANSCRIPTS_DESTINATION:
+            Fn::GetAtt:
+            - S3BucketNameResource
+            - BucketName
+          WAIT_TIME:
+            Ref: TranscriptionJobCheckWaitTime
+      Events:
+        StartTranscribeExecutionEvent:
+          Properties:
+            Bucket:
+              Ref: SrcBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                - Name: prefix
+                  Value:
+                    Ref: RecordingsPrefix
+          Type: S3
+      FunctionName: execute_transcription_state_machine
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role:
+        Fn::GetAtt:
+        - StartTranscribeExecutionLambdaRole
+        - Arn
+      Runtime: python3.6
+      Timeout: 3
+    Type: AWS::Serverless::Function
+  StartTranscribeExecutionLambdaRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - states:StartExecution
+            - states:StopExecution
+            Effect: Allow
+            Resource: '*'
+          Version: '2012-10-17'
+        PolicyName: start_transcribe_execution_step_function_policy
+    Type: AWS::IAM::Role
+  stepfunctionpolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: "start_transcribe_execution_step_function_policy"
+      PolicyDocument:
+          Statement:
+          - Action:
+            - states:StartExecution
+            - states:StopExecution
+            Effect: Allow
+            Resource: '*'
+          Version: '2012-10-17'
+      Roles:
+        - Ref: "StartTranscribeExecutionLambdaRole"
+  SubmitTranscribeJobLambdaTask:
+    Properties:
+      CodeUri: s3://aws-machine-learning-blog/artifacts/sentiment-analysis-on-call-recordings/SubmitTranscribeJobLambdaTask.zip
+      Description: lambda to submit a transcribe job
+      FunctionName: submit_transcribe_job
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role:
+        Fn::GetAtt:
+        - SubmitTranscribeJobLambdaTaskRole
+        - Arn
+      Runtime: python3.6
+      Timeout: 3
+    Type: AWS::Serverless::Function
+  SubmitTranscribeJobLambdaTaskRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+        Version: '2012-10-17'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonTranscribeFullAccess
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - s3:GetObject
+            - s3:GetObjectAcl
+            Effect: Allow
+            Resource:
+              Fn::Join:
+              - ''
+              - - 'arn:aws:s3:::'
+                - Fn::GetAtt:
+                  - S3BucketNameResource
+                  - BucketName
+                - /*
+          Version: '2012-10-17'
+        PolicyName: submit_transcribe_job_transcribe_s3_policy
+    Type: AWS::IAM::Role
+  submittranscribes3Policy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: "submit_transcribe_job_transcribe_s3_policy"
+      PolicyDocument:
+          Statement:
+          - Action:
+            - s3:GetObject
+            - s3:GetObjectAcl
+            Effect: Allow
+            Resource:
+              Fn::Join:
+              - ''
+              - - 'arn:aws:s3:::'
+                - Fn::GetAtt:
+                  - S3BucketNameResource
+                  - BucketName
+                - /*
+          Version: '2012-10-17'
+      Roles:
+        - Ref: "SubmitTranscribeJobLambdaTaskRole"
+  TranscribeStateMachine:
+    Properties:
+      DefinitionString:
+        Fn::Sub: "{\n  \"Comment\": \"A state machine that submits a Job to transcribe\
+          \ audio\",\n  \"StartAt\": \"Submit Transcription Job\",\n  \"States\":\
+          \ {\n    \"Submit Transcription Job\": {\n      \"Type\": \"Task\",\n  \
+          \    \"Resource\": \"${SubmitTranscribeJobLambdaTask.Arn}\",\n      \"ResultPath\"\
+          : \"$.TranscriptionJob\",\n      \"Next\": \"Wait X Seconds\",\n      \"\
+          Retry\": [\n        {\n          \"ErrorEquals\": [\n            \"States.ALL\"\
+          \n          ],\n          \"IntervalSeconds\": 1,\n          \"MaxAttempts\"\
+          : 3,\n          \"BackoffRate\": 2\n        }\n      ]\n    },\n    \"Wait\
+          \ X Seconds\": {\n      \"Type\": \"Wait\",\n      \"SecondsPath\": \"$.wait_time\"\
+          ,\n      \"Next\": \"Get Transcription Job Status\"\n    },\n    \"Get Transcription\
+          \ Job Status\": {\n      \"Type\": \"Task\",\n      \"Resource\": \"${GetTranscribeJobLambdaTask.Arn}\"\
+          ,\n      \"Next\": \"Job Complete?\",\n      \"InputPath\": \"$.TranscriptionJob\"\
+          ,\n      \"ResultPath\": \"$.TranscriptionJob\",\n      \"Retry\": [\n \
+          \       {\n          \"ErrorEquals\": [\n            \"States.ALL\"\n  \
+          \        ],\n          \"IntervalSeconds\": 1,\n          \"MaxAttempts\"\
+          : 3,\n          \"BackoffRate\": 2\n        }\n      ]\n    },\n    \"Job\
+          \ Complete?\": {\n      \"Type\": \"Choice\",\n      \"Choices\": [\n  \
+          \      {\n          \"Variable\": \"$.TranscriptionJob.TranscriptionJobStatus\"\
+          ,\n          \"StringEquals\": \"FAILED\",\n          \"Next\": \"Job Failed\"\
+          \n        },\n        {\n          \"Variable\": \"$.TranscriptionJob.TranscriptionJobStatus\"\
+          ,\n          \"StringEquals\": \"COMPLETED\",\n          \"Next\": \"Save\
+          \ Transcription to S3\"\n        }\n      ],\n      \"Default\": \"Wait\
+          \ X Seconds\"\n    },\n    \"Job Failed\": {\n      \"Type\": \"Fail\",\n\
+          \      \"Cause\": \"Transcription job Failed\",\n      \"Error\": \"Transcription\
+          \ job FAILED\"\n    },\n    \"Save Transcription to S3\": {\n      \"Type\"\
+          : \"Task\",\n      \"Resource\": \"${SaveTranscriptionToS3LambdaTask.Arn}\"\
+          ,\n      \"InputPath\": \"$\",\n      \"End\": true,\n      \"Retry\": [\n\
+          \        {\n          \"ErrorEquals\": [\n            \"States.ALL\"\n \
+          \         ],\n          \"IntervalSeconds\": 1,\n          \"MaxAttempts\"\
+          : 3,\n          \"BackoffRate\": 2\n        }\n      ]\n    }\n  }\n}\n"
+      RoleArn:
+        Fn::GetAtt:
+        - TranscribeStatesExecutionRole
+        - Arn
+    Type: AWS::StepFunctions::StateMachine
+  TranscribeStatesExecutionRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - Fn::Sub: states.${AWS::Region}.amazonaws.com
+        Version: '2012-10-17'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+    Type: AWS::IAM::Role
+Transform: AWS::Serverless-2016-10-31
